@@ -1,34 +1,55 @@
 import * as redis from 'redis';
 import { promisify } from 'util';
 
-const { promisify } = require('util');
-
 export class RedisClient {
-    constructor() {
-        this.clnt = redis.createClient();
-        this.getAsc = promisify(this.clnt.get).bind(this.clnt);
+  /**
+     * create a redis client
+     */
+  constructor() {
+    this.client = redis.createClient();
+    this.client.on('error', (err) => {
+      console.log('Redis error: ', String(err));
+    });
+    this._set = promisify(this.client.set).bind(this.client);
+    this._get = promisify(this.client.get).bind(this.client);
+    this._del = promisify(this.client.del).bind(this.client);
+  }
 
-        this.clnt.on('error', (err) => {
-            console.log(`${err}`);
-        });
-    }
+  /**
+     * checking if the client is connected to the database
+     * @returns {boolean}
+     */
+  isAlive() {
+    return this.client.connected;
+  }
 
-isAlive() {
-    return this.clnt.connected;
-}
+  /**
+     * getting the value from the database
+     * @return {promise<string>}
+     * @async
+     */
+  async get(key) {
+    return this._get(key);
+  }
 
-async get(k) {
-    const v = await this.getAsc(k);
-    return v;
-}
+  /**
+     * set a value in the database
+     * @param {string} key - key too store
+     * @param {string} value - Value to store
+     * @param {number} duration - Duration in seconds
+     * @async
+     */
+  async set(key, value, duration) {
+    await this._set(key, value, 'EX', duration);
+  }
 
-async set(k, v, d) {
-    this.clnt.expire(k, d);
-    this.clnt.expire(k, d);
-}
-
-async del(k) {
-    this.clnt.del(k);
+  /**
+     * Delete a value from the database
+     * @param {string} key
+     * @async
+     */
+  async del(key) {
+    await this._del(key);
   }
 }
 
