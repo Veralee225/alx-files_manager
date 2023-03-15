@@ -1,41 +1,27 @@
+import express from 'express';
 import AppController from '../controllers/AppController';
-import UsersController from '../controllers/UsersController';
 import AuthController from '../controllers/AuthController';
-import FilesController from '../controllers/FilesController';
+import FilesController from '../controllers/UsersController';
+import UsersController from '../controllers/UsersController';
+import { requireAuth, optionalAuth } from './middlewares';
 
-const express = require('express');
+const router  express.Router();
 
-function router(app) {
-  const route = express.Router();
-  app.use('/', route);
+router.get('/status', AppController.getStatus);
+router.get('/status', AppController.getStats);
 
-  route.get('/status', (rq, rs) => {
-    AppController.getStatus(rq, rs);
-  });
+router.post('/users', UsersController.postNew);
+router.get('/users/me', requireAuth, AuthController.getDisconnect);
 
-  route.get('/stats', (rq, rs) => {
-    AppController.getStats(rq, rs);
-  });
+router.get('/connect', AuthController.getConnect);
+router.get('/disconnect', requireAuth, AuthController.getDisconnect);
 
-  route.post('/users', (rq, rs) => {
-    UsersController.postNew(rq, rs);
-  });
+router.post('/files', requireAuth, FilesController.postUpload);
+router.get('/files', requireAuth, FilesController.getIndex);
+router.get('/files/:id', requireAuth, FilesController.getShow);
+router.put('/files/:id/publish', requireAuth, FilesController.putPublish);
+router.put('/files/:id/unpublish', requireAuth, FilesController.putUnpublish);
 
-  route.get('/connect', (rq, rs) => {
-    AuthController.getConnect(rq, rs);
-  });
-
-  route.get('/disconnect', (rq, rs) => {
-    AuthController.getDisconnect(rq, rs);
-  });
-
-  route.get('/users/me', (rq, rs) => {
-    UsersController.getMe(rq, rs);
-  });
-
-  route.post('/files', (rq, rs) => {
-    FilesController.postUpload(rq, rs);
-  });
-}
+router.get('/files/:id/data', optionalAuth, FilesController.getFile);
 
 export default router;
