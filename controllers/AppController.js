@@ -1,22 +1,18 @@
 import redisClient from '../utils/redis';
 import dbClient from '../utils/db';
 
-class AppController {
-  static getStatus(rq, rs) {
-    const alive = {
+export default class AppController {
+  static getStatus(_req, res) {
+    res.status(200).json({
       redis: redisClient.isAlive(),
       db: dbClient.isAlive(),
-    };
-    return rs.status(200).send(alive);
+    });
   }
 
-  static async getStats(rq, rs) {
-    const nbr = {
+  static async getStats(_req, res) {
+    res.status(200).json({
       users: await dbClient.nbUsers(),
       files: await dbClient.nbFiles(),
-    };
-    return rs.status(200).send(nbr);
+    });
   }
 }
-
-export default AppController;
