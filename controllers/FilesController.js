@@ -1,84 +1,168 @@
-import { ObjectId } from 'mongodb';
-import uuid4 from 'uuid';
-import { mkdir, writeFile } from 'fs';
-import dbClient from '../utils/db';
+import { promises as fs, existsSync as fsExistsSync } from 'fs';
+import { v4 as uuidv4 } from 'uuid';
+import mime from 'mime-types';
+import dbClient, { ObjectId } from '../utils/db';
+import { fileQueue } from '../worker';
 
-class FilesController {
-  static async postUpload(rq, rs) {
-    const usrId = rq.headers('X-Token') || null;
-    if (!usrId) return rs.status(401).send({ error: 'Unauthorized' });
-    const usr = dbClient.users.findOne({ _id: ObjectId(usrId) });
-    if (!usr) return rs.status(401).send({ error: 'Unauthorized' });
+const ACCEPTED_TYPES = ['folder', 'files', 'image'];
+const FOLDER_LOCATION = process.env.FOLDER_PATH || '/tmp/files_manager';
 
-    const fname = rq.body.name;
-    if (!fname) return rs.status(400).send({ error: 'Missing name' });
-    const ftype = rq.body.type;
-    const acceptType = ['folder', 'file', 'image'];
-    if (!ftype || (!acceptType.includes(ftype))) {
-      return rs.status(400).send({ error: 'Missing type' });
+export default class FilesController {
+  /** POST /files */
+  static async postUpload(req, res) {
+    const { userId } = req;
+    const document = await FilesController._getFileProperties(req);
+    if (document.error) return res.status(400).json({ error: document.error });
+    document.userId = userId;
+    if (document.type !== 'folder') {
+      const { localPath, error } = await FilesController._saveDocument(document);
+      if (error) return res.status(400).json({ error });
+      document.localPath = localPath;
     }
-    const fdata = rq.body.data;
-    if (!fdata && ftype !== 'folder') {
-      rs.status(400).send({ error: 'Missing data' });
+    delete document.data;
+    const file = await dbClient.fileCollection.insertOne(document);
+    if (document.type === 'image') {
+      fileQueue.add({ fileId: file.insertedId, userId });
     }
-    let fparentId = rq.body.parentId;
-    if (fparentId) {
-      const Parent = await dbClient.files.findOne({ _id: ObjectId(fparentId) });
-      if (!Parent) return rs.status(400).send({ error: 'Parent not found' });
-      if (Parent !== 'folder') {
-        return rs.status(400).send({ error: 'Parent is not a folder' });
+    delete document.localPath;
+    delete document._id;
+    if (document.paarentId === '0') document.parentId = 0;
+    return res.status(201).json({ id: file.insertedId, ...document });
+  }
+
+  /** GET /files:id */
+  static async getShow(req, res) {
+    const { params: { id }, userId } = req;
+    try {
+      const file = await dbClient.findUserFileById(userId, id);
+      if (!file) return res.status(404).json({ error: 'Not found' });
+      return res.status(200).json(FilesController._sanitizeFile(file));
+    } catch (error) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+  }
+
+  /** GET /files */
+  static async getIndex(req, res) {
+    const { userId } = req;
+    const { parentId = 0, page = 0 } = req.query;
+    try {
+      const { files = [] } = await dbClient.findUserFiles(userId, parentId, { page });
+      return res.status(200).json(files);
+    } catch (err) {
+      return res.status(200).json([]);
+    }
+  }
+
+  /** PUT /files/:id/publish */
+  static async putPublish(req, res) {
+    const { params: { id }, userId } = req;
+    try {
+      const file = await dbClient.findUserFileById(userId, id);
+      if (!file) return res.status(404).json({ error: 'Not found' });
+      if (!file.isPublic) {
+        await dbClient.updateFileById(file._id, { $set: { isPublic: true } });
+        file.isPublic = true;
       }
+      return res.status(200).json(FilesController._sanitizeFile(file));
+    } catch (err) {
+      return res.status(404).json({ error: 'Not found ' });
+    }
+  }
+
+  /** PUT /files/:id/unpublish */
+  static async putUnpublish(req, res) {
+    const { params: { id }, userId } = req;
+    try {
+      const file = await dbClient.findUserFileById(userId, id);
+      if (!file) return res.status(404).json({ error: 'Not found' });
+      if (file.isPublic) {
+        await dbClient.updateFileById(file._id, { $set: { isPublic: false } });
+        file.isPublic = false;
+      }
+      return res.status(200).json(FilesController._sanitizeFile(file));
+    } catch (err) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+  }
+
+  /** GET /files/:id/data */
+  static async getFile(req, res) {
+    const { params: { id }, query: { size }, userId } = req;
+    const file = await dbClient.findFileById(id);
+    if (!file) {
+      return res.status(404).json({ error: 'Not foound' });
+    }
+    if (!file.isPublic && String(file.userId) !== String(userId)) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    if (file.type === 'folder') {
+      return res.status(400).json({ error: 'A folder doesn\'t have content' });
+    }
+    const path = size ? `${file.localPath}_${size}` : file.localPath;
+    if (!fsExistsSync(path)) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    try {
+      const data = await fs.readFile(path);
+      const mimeType = mime.contentType(file.name) || 'text/plain';
+      res.setHeader('Content-Length', data.length);
+      res.setHeader('Content-Type', mimeType);
+      return res.status(200).send(data);
+    } catch (error) {
+      return res.status(404).json({ error: 'Error while reading file' });
+    }
+  }
+
+  static async _getFileProperties(req) {
+    const {
+      name, type, parentId = 0, isPublic = false, data,
+    } = req.body;
+    if (!name) return { error: 'Missing name' };
+    if (!type || !(ACCEPTED_TYPES.includes(type))) return { error: 'Missing type' };
+    if (type !== 'folder' && !data) return { error: 'Missing data' };
+    const file = {
+      name, type, parentId, isPublic, data,
+    };
+    if (String(parentId) !== '0') {
+      const parent = await dbClient.findFileById(parentId);
+      if (!parent) return { error: 'Parent not found' };
+      if (parent.type !== 'folder') return { error: 'Parent is not a folder' };
+      file.parentId = new ObjectId(parentId);
     } else {
-      fparentId = 0;
+      file.parentId = '0';
     }
-    const fisPublic = rq.body.isPublic || false;
+    return file;
+  }
 
-    const finsert = {
-      userId: usr._id,
-      name: fname,
-      type: ftype,
-      parentId: fparentId,
-      isPublic: fisPublic,
-    };
-    if (ftype === 'folder') {
-      await dbClient.files.insertOne(finsert);
-      const rtrnd = {
-        id: finsert._id,
-        userId: finsert.userId,
-        name: finsert.name,
-        type: finsert.type,
-        isPublic: finsert.isPublic,
-        parentId: finsert.parentId,
-      };
-      rs.status(201).send(rtrnd);
+  static async _saveDocument(document) {
+    try {
+      await fs.mkdir(FOLDER_LOCATION, { recursive: true });
+      const localPath = `${FOLDER_LOCATION}/${uuidv4()}`;
+      await fs.writeFile(localPath, document.data, 'base64');
+      return { localPath };
+    } catch (error) {
+      return { error: 'Error while saving file' };
     }
+  }
 
-    const folderPath = process.env.FOLDER_PATH || '/tmp/files_manager';
-    const lfname = uuid4();
-    const path = `${folderPath}/${lfname}`;
-    const lfdata = Buffer.from(fdata, 'base-64');
+  static async _saveThumbnail(thumbnail, file, size) {
+    try {
+      await fs.mkdir(FOLDER_LOCATION, { recursive: true });
+      const path = `${file.localPath}_${size}`;
+      await fs.writeFile(path, thumbnail);
+      return { path };
+    } catch (error) {
+      return { error: 'Error while saving thumbnail' };
+    }
+  }
 
-    mkdir(folderPath, { recursive: true }, (err) => {
-      if (err) return rs.status(400).send(err.message);
-      return true;
-    });
-
-    writeFile(path, lfdata, (err) => {
-      if (err) return rs.status(400).send(err.message);
-      return true;
-    });
-    finsert.localpath = path;
-    await dbClient.files.insertOne(finsert);
-    const rtrnd2 = {
-      id: finsert._id,
-      userId: finsert.userId,
-      name: finsert.name,
-      type: finsert.type,
-      isPublic: finsert.isPublic,
-      parentId: finsert.parentId,
-    };
-    return rs.status(201).send(rtrnd2);
+  /** remove sensitive properties from file object */
+  static _sanitizeFile(file) {
+    const clone = { ...file };
+    clone.id = clone._id;
+    delete clone.localPath;
+    delete clone._id;
+    return clone;
   }
 }
-
-export default FilesController;
